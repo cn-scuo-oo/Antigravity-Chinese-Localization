@@ -4,6 +4,20 @@ Antigravity 深度汉化与高性能本地化补丁程序
 
 中文 | [English](README.en.md)
 
+> [!IMPORTANT]
+> **本仓库声明（个人私有备份）**
+>
+> 本仓库是开源项目 **[antigravity-cn-community/Antigravity-Chinese-Localization](https://github.com/antigravity-cn-community/Antigravity-Chinese-Localization)** 的个人私有备份。
+>
+> **所有核心汉化工作与原创成果均归上游原作者 [aabbWei](https://github.com/aabbWei) 及 [`antigravity-cn-community`](https://github.com/antigravity-cn-community) 社区贡献者所有**，本项目遵循其 MIT License 并保留完整版权声明（见 [LICENSE](LICENSE)）。
+>
+> 本仓库仅包含少量个人定制，供自用：
+> - `src/dictionary.js` — 新增服务端下发的建议提示卡片词条
+> - `src/dom-translator.js` — 新增建议提示词输入框草稿自动汉化补丁（`__agyComposerPromptPatch`）
+> - `.gitignore` — 排除汉化运行时生成的 `extracted/` 工作目录
+>
+> 上游更新将通过 `upstream` remote 持续同步，感谢原作者与社区的付出。以下为原项目 README：
+
 [![GitHub release](https://img.shields.io/github/v/release/antigravity-cn-community/Antigravity-Chinese-Localization?style=flat&color=blue)](https://github.com/antigravity-cn-community/Antigravity-Chinese-Localization/releases/latest)
 [![GitHub downloads](https://img.shields.io/github/downloads/antigravity-cn-community/Antigravity-Chinese-Localization/total?style=flat&color=success)](https://github.com/antigravity-cn-community/Antigravity-Chinese-Localization/releases)
 [![GitHub stars](https://img.shields.io/github/stars/antigravity-cn-community/Antigravity-Chinese-Localization?style=flat&color=gold)](https://github.com/antigravity-cn-community/Antigravity-Chinese-Localization/stargazers)

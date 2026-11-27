@@ -4,6 +4,15 @@ Deep Localization & High-Performance Chinese Patch for Google Antigravity
 
 [中文](README.md) | English
 
+> [!IMPORTANT]
+> **Repository Notice (Personal Private Backup)**
+>
+> This repository is a personal private backup of the open-source project **[antigravity-cn-community/Antigravity-Chinese-Localization](https://github.com/antigravity-cn-community/Antigravity-Chinese-Localization)**.
+>
+> **All core localization work and original achievements belong to the upstream author [aabbWei](https://github.com/aabbWei) and the [`antigravity-cn-community`](https://github.com/antigravity-cn-community) contributors.** This backup follows the upstream MIT License and keeps the full copyright notice (see [LICENSE](LICENSE)).
+>
+> Only minor personal customizations are added for private use (a few dictionary entries and a composer prompt auto-translation patch). Upstream updates are continuously synced via the `upstream` remote. Credit goes to the original author and community. The original README follows:
+
 [![GitHub release](https://img.shields.io/github/v/release/antigravity-cn-community/Antigravity-Chinese-Localization?style=flat&color=blue)](https://github.com/antigravity-cn-community/Antigravity-Chinese-Localization/releases/latest)
 [![GitHub downloads](https://img.shields.io/github/downloads/antigravity-cn-community/Antigravity-Chinese-Localization/total?style=flat&color=success)](https://github.com/antigravity-cn-community/Antigravity-Chinese-Localization/releases)
 [![GitHub stars](https://img.shields.io/github/stars/antigravity-cn-community/Antigravity-Chinese-Localization?style=flat&color=gold)](https://github.com/antigravity-cn-community/Antigravity-Chinese-Localization/stargazers)
