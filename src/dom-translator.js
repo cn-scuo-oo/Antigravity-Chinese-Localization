@@ -4748,8 +4748,6 @@
           translateNode(node);
         }
       }
-
-      // 4. 建议提示模板草稿改写已由主世界补丁自带的 MutationObserver 处理（__agyComposerPromptPatch）
     } catch (e) {
       console.error('Batch translation error:', e);
     } finally {

@@ -1,0 +1,1399 @@
+"use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.registerIpcHandlers = registerIpcHandlers;
+const electron_1 = require("electron");
+const types_1 = require("./types");
+const updater_1 = require("./updater");
+const main_1 = __importDefault(require("electron-log/main"));
+const fs = __importStar(require("fs/promises"));
+const fsSync = __importStar(require("fs"));
+const path = __importStar(require("path"));
+const paths_1 = require("./paths");
+const debugConsole_1 = require("./debugConsole");
+const customScheme_1 = require("./customScheme");
+const tray_1 = require("./tray");
+const webviewBrowser_1 = require("./webviewBrowser");
+const constants_1 = require("./ideInstall/constants");
+const deviceChooser_1 = require("./deviceChooser");
+const url_1 = require("url");
+const wsl_1 = require("./wsl");
+const menu_1 = require("./menu");
+const scriptJail_1 = require("./scriptJail");
+const externalUrl_1 = require("./externalUrl");
+const utils_1 = require("./utils");
+const windowState_1 = require("./windowState");
+const hubZoom_1 = require("./hubZoom");
+const wcvBrowserRegistry_1 = require("./wcvBrowserRegistry");
+const wcvIpcHandlers_1 = require("./wcvIpcHandlers");
+const guestDialogController_1 = require("./guestDialogController");
+const guestFileChooserController_1 = require("./guestFileChooserController");
+const guestPromptController_1 = require("./guestPromptController");
+const webviewPromptPreload_1 = require("./webviewPromptPreload");
+const isolatedWorldExec_1 = require("./isolatedWorldExec");
+const guestFrameBridge_1 = require("./guestFrameBridge");
+const guestNetworkController_1 = require("./guestNetworkController");
+const guestWebMcpController_1 = require("./guestWebMcpController");
+const windowBackends_1 = require("./remote/windowBackends");
+const remoteWindowSecurity_1 = require("./remote/remoteWindowSecurity");
+function isMainFramePromptCaller(event) {
+    const s = event?.sender;
+    return Boolean(s &&
+        !s.isDestroyed?.() &&
+        !event?.senderFrame?.parent &&
+        (!event?.senderFrame || !s.mainFrame || event.senderFrame === s.mainFrame));
+}
+// Not SSH windows: they have no guests or session preloads to prompt from.
+const onHumanPromptSync = (event, rawJson) => {
+    if ((0, remoteWindowSecurity_1.isRemoteContents)(event?.sender)) {
+        event.returnValue = null;
+        return;
+    }
+    guestPromptController_1.guestPromptController.handleSyncPrompt(event, rawJson);
+};
+const onHumanPromptSubscriberState = (event, subscribed) => {
+    if (isMainFramePromptCaller(event) && !(0, remoteWindowSecurity_1.isRemoteContents)(event.sender)) {
+        guestPromptController_1.guestPromptController.setHostSubscribed(event.sender, Boolean(subscribed));
+    }
+};
+deviceChooser_1.deviceChooserController.setHostResolver((webContentsId) => wcvBrowserRegistry_1.wcvBrowserRegistry.resolveDeviceChooserHost(webContentsId));
+function onDeviceChooserSubscriberState(event, subscribed) {
+    if ((0, wcvIpcHandlers_1.isAuthorizedHubMainFrameEvent)(event)) {
+        deviceChooser_1.deviceChooserController.setHostSubscribed(event.sender, Boolean(subscribed));
+    }
+}
+/** Hub window that sent an IPC message, if it still exists. */
+function windowForSender(sender) {
+    // A destroyed sender's getters (e.g. hostWebContents) throw.
+    if (!sender || sender.isDestroyed?.()) {
+        return undefined;
+    }
+    const win = (0, utils_1.resolveHubWindowFromWebContents)(sender);
+    return win && !win.isDestroyed?.() ? win : undefined;
+}
+/**
+ * Registers a channel SSH windows can't use (defense in depth: their preload
+ * lacks it). Remote content must not reach the laptop's dialogs, updater,
+ * logs (they name local ports), plugin:// map, files, IDE, WSL, built-in
+ * browser or script jail.
+ */
+function localOnly(channel, handler) {
+    electron_1.ipcMain.handle(channel, (event, ...args) => {
+        if ((0, remoteWindowSecurity_1.isRemoteContents)(event?.sender)) {
+            throw new Error(`${channel} is not available in SSH windows`);
+        }
+        return handler(event, ...args);
+    });
+}
+/** Longest notification title/body accepted from a page. */
+const MAX_NOTIFICATION_TITLE = 200;
+const MAX_NOTIFICATION_BODY = 1000;
+function truncate(text, max) {
+    const s = typeof text === 'string' ? text : '';
+    return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+function buildContextMenuTemplate(items, onSelect) {
+    return items.map((item) => {
+        if (item.type === 'separator') {
+            return { type: 'separator' };
+        }
+        if (item.type === 'submenu' || (item.submenu && item.submenu.length > 0)) {
+            return {
+                id: item.id,
+                label: (typeof translateContextLabel === 'function' ? translateContextLabel(item.label) : item.label) ?? '',
+                type: 'submenu',
+                enabled: !item.disabled,
+                submenu: buildContextMenuTemplate(item.submenu ?? [], onSelect),
+            };
+        }
+        return {
+            id: item.id,
+            label: (typeof translateContextLabel === 'function' ? translateContextLabel(item.label) : item.label) ?? '',
+            type: item.type ?? 'normal',
+            checked: item.checked,
+            enabled: !item.disabled,
+            accelerator: item.accelerator,
+            click: () => {
+                onSelect(item.id);
+            },
+        };
+    });
+}
+/**
+ * Registers all IPC handlers for the main process.
+ */
+const SAFE_UPLOAD_CONVERSATION_ID_RE = /^[A-Za-z0-9._-]+$/;
+function registerIpcHandlers(storageManager, deps = {}) {
+    (0, hubZoom_1.setHubZoomStorageManager)(storageManager);
+    /** For an SSH window its own (never another), else the focused or first. */
+    const getTargetHubWindow = (sender) => (0, remoteWindowSecurity_1.isRemoteContents)(sender)
+        ? windowForSender(sender)
+        : ((0, utils_1.getFocusedHubWindow)() ?? (0, utils_1.getHubWindows)()[0]);
+    const storageFor = (sender) => {
+        const store = sender && deps.resolveStorage?.(sender);
+        if (store) {
+            return store;
+        }
+        // Fail closed: other remote contents get no store, never the main one.
+        if ((0, remoteWindowSecurity_1.isRemoteContents)(sender)) {
+            throw new Error('Storage is not available in this SSH window');
+        }
+        return storageManager;
+    };
+    // Dialog
+    // In WSL mode, start the folder dialog in the distro's home directory.
+    async function dialogDefaultPath() {
+        const distro = (0, wsl_1.getActiveWslDistro)();
+        if (!distro) {
+            return undefined;
+        }
+        try {
+            return (0, wsl_1.distroToWindowsPath)(await (0, wsl_1.getDistroHome)(distro), distro);
+        }
+        catch {
+            return undefined;
+        }
+    }
+    // In WSL mode, translate a picked Windows path to the distro's view.
+    // Returns undefined when the path is unusable (e.g. another distro).
+    function mapPickedPath(picked) {
+        const distro = (0, wsl_1.getActiveWslDistro)();
+        if (!distro) {
+            return picked;
+        }
+        const t = (0, wsl_1.windowsToDistroPath)(picked, distro);
+        if (t.error) {
+            electron_1.dialog.showErrorBox('无法打开文件夹', t.error);
+            return undefined;
+        }
+        if (t.warning) {
+            void electron_1.dialog.showMessageBox({
+                type: 'warning',
+                message: '文件夹位于 Windows 文件系统中',
+                detail: t.warning,
+            });
+        }
+        return t.path;
+    }
+    localOnly('dialog:open-workspace', async () => {
+        const result = await electron_1.dialog.showOpenDialog({
+            properties: ['openDirectory', 'createDirectory'],
+            title: '打开工作区',
+            defaultPath: await dialogDefaultPath(),
+        });
+        if (result.canceled || result.filePaths.length === 0) {
+            return undefined;
+        }
+        return mapPickedPath(result.filePaths[0]);
+    });
+    localOnly('dialog:get-default-download-dir', (event) => {
+        const sender = event?.sender;
+        if (!sender ||
+            sender.isDestroyed?.() ||
+            event?.senderFrame?.parent ||
+            (event?.senderFrame &&
+                sender.mainFrame &&
+                event.senderFrame !== sender.mainFrame) ||
+            sender.getType?.() === 'webview' ||
+            (typeof sender.id === 'number' &&
+                wcvBrowserRegistry_1.wcvBrowserRegistry.isRegisteredWcv(sender.id))) {
+            throw new Error('Unauthorized dialog:get-default-download-dir sender');
+        }
+        try {
+            const downloadsDir = electron_1.app.getPath('downloads');
+            if (typeof downloadsDir !== 'string' || downloadsDir.includes('\0')) {
+                return null;
+            }
+            const trimmed = downloadsDir.trim();
+            return trimmed.length > 0 ? trimmed : null;
+        }
+        catch {
+            return null;
+        }
+    });
+    // Like 'dialog:open-workspace' but allows selecting multiple folders,
+    // returning an array of paths (empty if cancelled).
+    localOnly('dialog:open-workspaces', async () => {
+        const result = await electron_1.dialog.showOpenDialog({
+            properties: ['openDirectory', 'createDirectory', 'multiSelections'],
+            title: '打开工作区',
+            defaultPath: await dialogDefaultPath(),
+        });
+        if (result.canceled || result.filePaths.length === 0) {
+            return [];
+        }
+        return result.filePaths
+            .map(mapPickedPath)
+            .filter((p) => p !== undefined);
+    });
+    // Auto-updater
+    localOnly('updater:apply', async () => {
+        (0, updater_1.broadcastState)({ type: types_1.UpdateState.Ready });
+    });
+    localOnly('updater:quit-and-install', () => (0, updater_1.quitAndInstall)());
+    localOnly('updater:get-state', () => {
+        return (0, updater_1.getLastState)();
+    });
+    // Notifications
+    electron_1.ipcMain.handle('notification:send', (event, options) => {
+        // Named by their host: an SSH window can't pose as the app.
+        const remote = (0, remoteWindowSecurity_1.isRemoteContents)(event?.sender);
+        const label = (0, windowBackends_1.remoteBackendOf)(event?.sender)?.label ?? 'SSH';
+        const remoteTitle = truncate(options?.title, MAX_NOTIFICATION_TITLE);
+        const notification = new electron_1.Notification({
+            title: remote
+                ? truncate(remoteTitle ? `${label}: ${remoteTitle}` : label, MAX_NOTIFICATION_TITLE)
+                : options.title,
+            body: remote
+                ? truncate(options?.body, MAX_NOTIFICATION_BODY)
+                : options.body,
+            silent: options?.silent ?? false,
+        });
+        notification.on('click', () => {
+            // A remote payload goes only to the window that posted it (if open); a
+            // local one to the first local window.
+            const win = remote
+                ? windowForSender(event?.sender)
+                : (0, utils_1.getLocalHubWindows)()[0];
+            if (win) {
+                if (win.isMinimized()) {
+                    win.restore();
+                }
+                win.show();
+                win.focus();
+                if (options?.payload) {
+                    win.webContents.send('notification:clicked', options.payload);
+                }
+            }
+        });
+        notification.show();
+    });
+    // Note: copied from our desktop AGY implementation:
+    // vs/platform/nativeNotification/electron-main/electronNotificationService.ts
+    electron_1.ipcMain.handle('notification:open-system-preferences', async () => {
+        if (process.platform === 'darwin') {
+            void electron_1.shell.openExternal('x-apple.systempreferences:com.apple.preference.notifications');
+        }
+        else if (process.platform === 'win32') {
+            void electron_1.shell.openExternal('ms-settings:notifications');
+        }
+        else if (process.platform === 'linux') {
+            const { exec } = await Promise.resolve().then(() => __importStar(require('child_process')));
+            const commands = [
+                'gnome-control-center notifications',
+                'systemsettings kcm_notifications',
+                'xfce4-notifyd-config',
+                'gnome-control-center',
+                'systemsettings',
+            ];
+            for (const command of commands) {
+                try {
+                    exec(command);
+                    return; // If one command executes without immediate error, assume success for now
+                }
+                catch {
+                    // Try next
+                }
+            }
+        }
+    });
+    const readOsMicAccessStatus = () => {
+        try {
+            return electron_1.systemPreferences.getMediaAccessStatus('microphone');
+        }
+        catch {
+            return 'unknown';
+        }
+    };
+    /**
+     * Whether `event` may use a mic channel SSH windows share: a local Hub
+     * window's main frame, or an SSH window's own top frame. Anything else on
+     * an SSH window's session is refused, as by localOnly().
+     */
+    const isMicCaller = (channel, event) => {
+        const sender = event?.sender;
+        if (!(0, remoteWindowSecurity_1.isRemoteContents)(sender)) {
+            return (0, wcvIpcHandlers_1.isAuthorizedHubMainFrameEvent)(event);
+        }
+        if (!(0, windowBackends_1.remoteBackendOf)(sender)) {
+            throw new Error(`${channel} is not available in SSH windows`);
+        }
+        // Its top frame (null once it navigated), while it lives.
+        return !sender.isDestroyed() && event.senderFrame === sender.mainFrame;
+    };
+    // SSH windows too, so a mic blocked in the OS settings says so there. They
+    // only read it: no OS prompt (mic:request-access), which getUserMedia shows
+    // anyway once the user allows their host the mic (remoteWindowSecurity.ts).
+    electron_1.ipcMain.handle('mic:get-access-status', (event) => {
+        if (!isMicCaller('mic:get-access-status', event)) {
+            return 'unknown';
+        }
+        if (process.platform === 'darwin' || process.platform === 'win32') {
+            return readOsMicAccessStatus();
+        }
+        return 'unknown';
+    });
+    let pendingMicAccessRequest = null;
+    localOnly('mic:request-access', async (event) => {
+        if (!(0, wcvIpcHandlers_1.isAuthorizedHubMainFrameEvent)(event)) {
+            return 'unknown';
+        }
+        if (process.platform === 'darwin') {
+            const status = readOsMicAccessStatus();
+            if (status !== 'not-determined') {
+                return status;
+            }
+            if (!pendingMicAccessRequest) {
+                pendingMicAccessRequest =
+                    (async () => {
+                        try {
+                            const granted = await electron_1.systemPreferences.askForMediaAccess('microphone');
+                            if (granted) {
+                                return 'granted';
+                            }
+                            const after = readOsMicAccessStatus();
+                            return after === 'not-determined' ? 'denied' : after;
+                        }
+                        catch {
+                            return 'unknown';
+                        }
+                        finally {
+                            pendingMicAccessRequest = null;
+                        }
+                    })();
+            }
+            return pendingMicAccessRequest;
+        }
+        if (process.platform === 'win32') {
+            return readOsMicAccessStatus();
+        }
+        return 'unknown';
+    });
+    // A fixed settings page, for SSH windows too.
+    electron_1.ipcMain.handle('mic:open-system-preferences', async (event) => {
+        if (!isMicCaller('mic:open-system-preferences', event)) {
+            return;
+        }
+        // Remote content mustn't open System Settings while you're elsewhere.
+        if ((0, remoteWindowSecurity_1.isRemoteContents)(event.sender) &&
+            !windowForSender(event.sender)?.isFocused()) {
+            throw new Error('mic:open-system-preferences is only available while the window is focused');
+        }
+        if (process.platform === 'darwin') {
+            await (0, externalUrl_1.openExternalSafely)('x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone', 'confirmed');
+        }
+        else if (process.platform === 'win32') {
+            await (0, externalUrl_1.openExternalSafely)('ms-settings:privacy-microphone', 'confirmed');
+        }
+    });
+    // Storage
+    electron_1.ipcMain.removeAllListeners?.('storage:get-items-sync');
+    electron_1.ipcMain.on('storage:get-items-sync', (event) => {
+        event.returnValue = (0, utils_1.isLocalHubTopFrame)(event)
+            ? storageManager.getItemsSync()
+            : null;
+    });
+    electron_1.ipcMain.handle('storage:get-items', async (event) => {
+        return storageFor(event?.sender).getItems();
+    });
+    electron_1.ipcMain.handle('storage:update-items', async (event, changes) => {
+        await storageFor(event?.sender).updateItems(changes);
+    });
+    // Logs
+    localOnly('logs:electron', async () => {
+        try {
+            const logPath = main_1.default.transports.file.getFile().path;
+            const contents = await fs.readFile(logPath, 'utf-8');
+            return contents;
+        }
+        catch (err) {
+            return `Failed to read logs: ${String(err)}`;
+        }
+    });
+    // Sidecar extension custom scheme: the laptop's map for local windows. An
+    // SSH window's map is its host's LS's list of sidecars, which main reads
+    // itself (remoteSidecars.ts): the send only says that the list changed.
+    electron_1.ipcMain.handle('extensions:send-authorities', async (event, authorities) => {
+        if ((0, remoteWindowSecurity_1.isRemoteContents)(event?.sender)) {
+            const backend = (0, windowBackends_1.remoteBackendOf)(event?.sender);
+            const routes = backend && deps.sidecarRoutesFor?.(event.sender);
+            if (!routes) {
+                throw new Error('extensions:send-authorities is not available in this SSH window');
+            }
+            const error = await routes.refresh();
+            if (error) {
+                main_1.default.warn(`[SSH] ${backend.label}: listing its sidecars failed: ${error}`);
+            }
+            return;
+        }
+        customScheme_1.extensionAuthorities.clear();
+        for (const [key, value] of Object.entries(authorities)) {
+            customScheme_1.extensionAuthorities.set(key, value);
+        }
+    });
+    // Agent
+    electron_1.ipcMain.handle('agent:update-active-count', async (event, count) => {
+        if ((0, remoteWindowSecurity_1.isRemoteContents)(event?.sender)) {
+            return; // The tray counts local agents (remote ones outlive quitting).
+        }
+        (0, tray_1.updateTrayAgentCount)(count);
+    });
+    // Window
+    electron_1.ipcMain.handle('window:set-title-bar-overlay', async (event, options) => {
+        // The sender's own window: each window has its own overlay, and a theme
+        // change reaches every window's renderer, focused or not.
+        const win = windowForSender(event?.sender);
+        // Windows and Linux windows both get a native caption-button overlay
+        // (see createWindow in utils.ts), so keep them in sync; macOS has none.
+        // A window whose page draws its own buttons (Insiders by default, or
+        // --custom-window-controls) has no overlay to update (Electron would
+        // throw), so do nothing for it. Asked per window, not per app: SSH
+        // windows keep the native buttons (see createWindow), so update theirs.
+        if (win && !(0, utils_1.isMacOS)() && !(0, utils_1.hasCustomWindowControls)(win)) {
+            // Omit a missing height: Electron keeps the fields it isn't given, so
+            // a colors-only update must not reset a taller titlebar's buttons.
+            // The key is left out rather than set to `undefined`: Electron checks
+            // whether each field is present, and today an `undefined` one is only
+            // skipped because converting it to an int fails quietly.
+            const height = (0, windowState_1.titleBarOverlayHeight)(options.height);
+            win.setTitleBarOverlay({
+                color: options.color,
+                symbolColor: options.symbolColor,
+                ...(height !== undefined ? { height } : {}),
+            });
+        }
+    });
+    // Window buttons act on the sender's own window, never the focused one: a
+    // page-drawn button can be clicked, or isMaximized() asked, in a window
+    // that isn't focused (e.g. one just opened in the background). A sender
+    // with no Hub window gets nothing.
+    electron_1.ipcMain.handle('window:minimize', async (event) => {
+        const win = windowForSender(event?.sender);
+        if (win) {
+            win.minimize();
+        }
+    });
+    electron_1.ipcMain.handle('window:maximize', async (event) => {
+        const win = windowForSender(event?.sender);
+        if (win) {
+            win.maximize();
+        }
+    });
+    electron_1.ipcMain.handle('window:unmaximize', async (event) => {
+        const win = windowForSender(event?.sender);
+        if (win) {
+            win.unmaximize();
+        }
+    });
+    electron_1.ipcMain.handle('window:is-maximized', async (event) => {
+        const win = windowForSender(event?.sender);
+        return win ? win.isMaximized() : false;
+    });
+    electron_1.ipcMain.handle('window:close', async (event) => {
+        const win = windowForSender(event?.sender);
+        if (win) {
+            win.close();
+        }
+    });
+    electron_1.ipcMain.handle('window:toggle-devtools', async (event) => {
+        // An SSH window's top frame too (the other check takes local windows only).
+        const allowed = (0, windowBackends_1.remoteBackendOf)(event?.sender)
+            ? !!event.senderFrame && event.senderFrame === event.sender.mainFrame
+            : (0, wcvIpcHandlers_1.isAuthorizedHubMainFrameEvent)(event);
+        if (!(0, debugConsole_1.isDebugConsoleEnabled)() || !allowed) {
+            return;
+        }
+        const win = windowForSender(event?.sender);
+        if (!win) {
+            return;
+        }
+        const targetContents = (0, utils_1.getHubWebContents)(win) ?? win.webContents;
+        if (targetContents && !targetContents.isDestroyed?.()) {
+            targetContents.toggleDevTools();
+        }
+    });
+    electron_1.ipcMain.removeListener?.(deviceChooser_1.WEBVIEW_DEVICE_CHOOSER_SUBSCRIBER_STATE_CHANNEL, onDeviceChooserSubscriberState);
+    electron_1.ipcMain.on?.(deviceChooser_1.WEBVIEW_DEVICE_CHOOSER_SUBSCRIBER_STATE_CHANNEL, onDeviceChooserSubscriberState);
+    localOnly(deviceChooser_1.WEBVIEW_DEVICE_CHOOSER_RESPONSE_CHANNEL, async (event, requestId, resolution) => {
+        if (!(0, wcvIpcHandlers_1.isAuthorizedHubMainFrameEvent)(event)) {
+            throw new Error('Unauthorized webview:device-chooser-response sender');
+        }
+        if (typeof requestId !== 'string' ||
+            requestId.length === 0 ||
+            !resolution ||
+            typeof resolution !== 'object') {
+            return false;
+        }
+        const { action, deviceId } = resolution;
+        if (action === 'claim' || action === 'unclaimed' || action === 'cancel') {
+            return deviceChooser_1.deviceChooserController.respond(event.sender, requestId, {
+                action,
+            });
+        }
+        if (action === 'select' &&
+            typeof deviceId === 'string' &&
+            deviceId.length > 0) {
+            return deviceChooser_1.deviceChooserController.respond(event.sender, requestId, {
+                action: 'select',
+                deviceId,
+            });
+        }
+        return false;
+    });
+    let activeContextMenu = null;
+    // An SSH window may close only its own window's menu.
+    let activeContextMenuOwner;
+    electron_1.ipcMain.handle('window:show-context-menu', async (event, items) => {
+        const win = getTargetHubWindow(event?.sender);
+        if (!win || !Array.isArray(items) || items.length === 0) {
+            return null;
+        }
+        // An SSH window's page, while one of the Hub's questions is up there.
+        if ((0, remoteWindowSecurity_1.isRemoteContents)(event?.sender) && deps.hostQuestionBusy?.(win)) {
+            return null;
+        }
+        activeContextMenu?.closePopup?.(win);
+        return new Promise((resolve) => {
+            let settled = false;
+            const template = buildContextMenuTemplate(items, (id) => {
+                if (!settled) {
+                    settled = true;
+                    activeContextMenu = null;
+                    activeContextMenuOwner = undefined;
+                    resolve(id);
+                }
+            });
+            const menu = electron_1.Menu.buildFromTemplate(template);
+            activeContextMenu = menu;
+            activeContextMenuOwner = win;
+            menu.popup({
+                window: win,
+                callback: () => {
+                    setImmediate(() => {
+                        if (activeContextMenu === menu) {
+                            activeContextMenu = null;
+                            activeContextMenuOwner = undefined;
+                        }
+                        if (!settled) {
+                            settled = true;
+                            resolve(null);
+                        }
+                    });
+                },
+            });
+        });
+    });
+    electron_1.ipcMain.handle('window:close-context-menu', (event) => {
+        const win = getTargetHubWindow(event?.sender);
+        if ((0, remoteWindowSecurity_1.isRemoteContents)(event?.sender) && activeContextMenuOwner !== win) {
+            return; // Not its own window's menu.
+        }
+        activeContextMenu?.closePopup?.(win);
+        activeContextMenu = null;
+        activeContextMenuOwner = undefined;
+    });
+    // Zoom — main-process source of truth so the level is reliably persisted
+    // across restarts on all platforms (works around a Chromium quirk on Windows
+    // where renderer-only webFrame.setZoomLevel changes aren't cached).
+    // The level is shared and Electron doesn't clamp it: SSH windows stay within
+    // Chrome's 25%-500% (factor 1.2^level).
+    const MIN_REMOTE_ZOOM_LEVEL = Math.log(0.25) / Math.log(1.2);
+    const MAX_REMOTE_ZOOM_LEVEL = Math.log(5) / Math.log(1.2);
+    const zoom = (event, action) => (0, hubZoom_1.applyHubWindowZoom)(getTargetHubWindow(event?.sender), action, (0, remoteWindowSecurity_1.isRemoteContents)(event?.sender)
+        ? (level) => Math.min(MAX_REMOTE_ZOOM_LEVEL, Math.max(MIN_REMOTE_ZOOM_LEVEL, level))
+        : undefined);
+    electron_1.ipcMain.handle('window:zoom-in', (event) => zoom(event, 'in'));
+    electron_1.ipcMain.handle('window:zoom-out', (event) => zoom(event, 'out'));
+    electron_1.ipcMain.handle('window:reset-zoom', (event) => zoom(event, 'reset'));
+    // Auto-updater manual check
+    localOnly('updater:check-for-updates', () => {
+        (0, updater_1.checkForUpdates)(true);
+    });
+    // Safe external shell launch
+    electron_1.ipcMain.handle('shell:open-external', async (event, url) => {
+        if ((0, remoteWindowSecurity_1.isRemoteContents)(event?.sender)) {
+            const sender = event.sender;
+            const open = deps.openFromRemote &&
+                ((checked) => deps.openFromRemote?.(sender, checked));
+            if ((0, remoteWindowSecurity_1.openRemoteUrl)(url, open) !== 'opened') {
+                const label = (0, windowBackends_1.remoteBackendOf)(event?.sender)?.label ?? 'an SSH window';
+                main_1.default.warn(`[SSH] Not opening a link from ${label}: blocked.`);
+            }
+            return;
+        }
+        await (0, externalUrl_1.openExternalSafely)(url, 'confirmed');
+    });
+    localOnly('shell:reveal-in-file-picker', (_event, path) => {
+        const distro = (0, wsl_1.getActiveWslDistro)();
+        if (distro) {
+            const posixPath = (0, url_1.fileURLToPath)(path, { windows: false });
+            electron_1.shell.showItemInFolder((0, wsl_1.distroToWindowsPath)(posixPath, distro));
+            return;
+        }
+        electron_1.shell.showItemInFolder((0, url_1.fileURLToPath)(path));
+    });
+    localOnly('webview:set-download-dir', (event, webContentsId, downloadDir) => {
+        if (typeof webContentsId !== 'number' ||
+            !Number.isInteger(webContentsId) ||
+            webContentsId <= 0) {
+            throw new Error(`Invalid webContentsId: ${String(webContentsId)}`);
+        }
+        if (downloadDir !== null && typeof downloadDir !== 'string') {
+            throw new Error('downloadDir must be a string or null');
+        }
+        if (event?.senderFrame?.parent) {
+            throw new Error('Unauthorized webview:set-download-dir sender: subframe cannot configure downloads');
+        }
+        const sender = event?.sender;
+        if (!sender || sender.isDestroyed?.()) {
+            throw new Error(`WebContents ${webContentsId} is not owned by the calling renderer`);
+        }
+        const wc = electron_1.webContents.fromId(webContentsId);
+        if (!(0, webviewBrowser_1.isOwnedBrowserGuestWebContents)(wc, sender.id)) {
+            throw new Error(`WebContents ${webContentsId} is not owned by the calling renderer`);
+        }
+        return (0, webviewBrowser_1.setGuestDownloadDirectory)(wc, downloadDir);
+    });
+    localOnly('webview:set-agent-controlled', (event, webContentsId, active) => {
+        // Same sender/ownership rules as webview:set-download-dir, but reject
+        // with `false` instead of throwing.
+        if (typeof webContentsId !== 'number' ||
+            !Number.isInteger(webContentsId) ||
+            webContentsId <= 0 ||
+            typeof active !== 'boolean') {
+            return false;
+        }
+        if (event?.senderFrame?.parent) {
+            return false;
+        }
+        const sender = event?.sender;
+        if (!sender || sender.isDestroyed?.()) {
+            return false;
+        }
+        const wc = electron_1.webContents.fromId(webContentsId);
+        if (!wc || !(0, webviewBrowser_1.isOwnedBrowserGuestWebContents)(wc, sender.id)) {
+            return false;
+        }
+        return (0, webviewBrowser_1.setGuestAgentControlled)(wc, active);
+    });
+    const assertTopLevelSenderId = (event, channel) => {
+        if (event?.senderFrame?.parent) {
+            throw new Error(`Unauthorized ${channel} sender: subframe cannot invoke ${channel}`);
+        }
+        const sender = event?.sender;
+        if (!sender ||
+            sender.isDestroyed?.() ||
+            typeof sender.id !== 'number' ||
+            !Number.isInteger(sender.id)) {
+            throw new Error(`Unauthorized ${channel} sender`);
+        }
+        return sender.id;
+    };
+    localOnly('webview:open-download', async (event, downloadId) => {
+        const senderId = assertTopLevelSenderId(event, 'webview:open-download');
+        if (typeof downloadId !== 'string') {
+            throw new Error('downloadId must be a string');
+        }
+        return (0, webviewBrowser_1.openTrackedWebviewDownload)(senderId, downloadId);
+    });
+    localOnly('webview:show-download-in-folder', (event, downloadId) => {
+        const senderId = assertTopLevelSenderId(event, 'webview:show-download-in-folder');
+        if (typeof downloadId !== 'string') {
+            throw new Error('downloadId must be a string');
+        }
+        return (0, webviewBrowser_1.showTrackedWebviewDownloadInFolder)(senderId, downloadId);
+    });
+    localOnly('webview:cancel-download', (event, downloadId) => {
+        const senderId = assertTopLevelSenderId(event, 'webview:cancel-download');
+        if (typeof downloadId !== 'string') {
+            throw new Error('downloadId must be a string');
+        }
+        return (0, webviewBrowser_1.cancelTrackedWebviewDownload)(senderId, downloadId);
+    });
+    localOnly('webview:resolve-download', (event, downloadId, approve) => {
+        // Approving resumes a paused agent download, so reject (return false)
+        // anything other than the owning host's main frame with valid args.
+        let senderId;
+        try {
+            senderId = assertTopLevelSenderId(event, 'webview:resolve-download');
+        }
+        catch {
+            return false;
+        }
+        if (typeof downloadId !== 'string' || typeof approve !== 'boolean') {
+            return false;
+        }
+        return (0, webviewBrowser_1.resolveTrackedWebviewDownload)(senderId, downloadId, approve);
+    });
+    localOnly('dialog:select-download-dir', async (event, defaultPath) => {
+        assertTopLevelSenderId(event, 'dialog:select-download-dir');
+        let resolvedDefaultPath;
+        if (typeof defaultPath === 'string' &&
+            defaultPath.trim().length > 0 &&
+            !defaultPath.includes('\0')) {
+            resolvedDefaultPath = defaultPath.trim();
+        }
+        else {
+            try {
+                resolvedDefaultPath = electron_1.app.getPath('downloads');
+            }
+            catch {
+                resolvedDefaultPath = undefined;
+            }
+        }
+        const options = {
+            properties: ['openDirectory', 'createDirectory'],
+            title: '选择下载文件夹',
+            defaultPath: resolvedDefaultPath,
+        };
+        const owner = electron_1.BrowserWindow.fromWebContents(event.sender);
+        const result = owner
+            ? await electron_1.dialog.showOpenDialog(owner, options)
+            : await electron_1.dialog.showOpenDialog(options);
+        if (result.canceled || result.filePaths.length === 0) {
+            return null;
+        }
+        const picked = result.filePaths[0];
+        if (typeof picked !== 'string' ||
+            picked.includes('\0') ||
+            !path.isAbsolute(picked)) {
+            return null;
+        }
+        try {
+            return (await fs.stat(picked)).isDirectory() ? picked : null;
+        }
+        catch {
+            return null;
+        }
+    });
+    // IDE installation check
+    localOnly('ide:is-installed', async () => {
+        try {
+            // Check standard installation path (works even if the app has never been launched).
+            await fs.stat((0, constants_1.getIdeInstallPath)());
+            return true;
+        }
+        catch {
+            return false;
+        }
+    });
+    // Per-guest renderer working-set memory in bytes for memory-budgeted LRU eviction.
+    localOnly('webview:get-memory-usage', async (event, webContentsIds) => {
+        const sender = event?.sender;
+        if (!sender ||
+            sender.isDestroyed() ||
+            event?.senderFrame?.parent ||
+            (event?.senderFrame &&
+                sender.mainFrame &&
+                event.senderFrame !== sender.mainFrame) ||
+            !Array.isArray(webContentsIds) ||
+            webContentsIds.length === 0) {
+            return {};
+        }
+        const MAX_QUERIED_GUESTS = 64;
+        const seenIds = new Set();
+        const ownedGuests = [];
+        for (const rawId of webContentsIds) {
+            if (seenIds.size >= MAX_QUERIED_GUESTS) {
+                break;
+            }
+            if (typeof rawId !== 'number' ||
+                !Number.isInteger(rawId) ||
+                rawId <= 0 ||
+                seenIds.has(rawId)) {
+                continue;
+            }
+            seenIds.add(rawId);
+            const wc = electron_1.webContents.fromId(rawId);
+            const isWcv = wcvBrowserRegistry_1.wcvBrowserRegistry.isRegisteredWcv(rawId);
+            if (!wc || wc.isDestroyed() || (wc.getType() !== 'webview' && !isWcv)) {
+                continue;
+            }
+            const isOwned = isWcv
+                ? wcvBrowserRegistry_1.wcvBrowserRegistry.isOwnedBySender(rawId, sender.id)
+                : Boolean(sender.id !== undefined && wc.hostWebContents?.id === sender.id);
+            if (!isOwned) {
+                continue;
+            }
+            let pid;
+            try {
+                pid = wc.getOSProcessId?.();
+            }
+            catch {
+                pid = undefined;
+            }
+            ownedGuests.push({ webContentsId: rawId, pid });
+        }
+        if (ownedGuests.length === 0) {
+            return {};
+        }
+        const bytesByWcId = wcvBrowserRegistry_1.wcvBrowserRegistry.computeGuestMemoryBytes(ownedGuests);
+        const out = {};
+        for (const [id, bytes] of bytesByWcId.entries()) {
+            out[id] = bytes;
+        }
+        return out;
+    });
+    // WSL environment switching (Windows only). Lets the web UI (e.g. the
+    // Settings page) discover WSL distros and relaunch the app into/out of one.
+    localOnly('wsl:get-state', async () => {
+        if (!(0, wsl_1.isWslAvailable)()) {
+            return { available: false, activeDistro: null, distros: [] };
+        }
+        try {
+            const distros = await (0, wsl_1.listWslDistros)();
+            return {
+                available: true,
+                activeDistro: (0, wsl_1.getActiveWslDistro)() ?? null,
+                distros: distros.map((d) => ({ name: d.name, isDefault: d.isDefault })),
+            };
+        }
+        catch (err) {
+            main_1.default.error('wsl:get-state failed:', err);
+            return { available: false, activeDistro: null, distros: [] };
+        }
+    });
+    // Relaunches into the given distro, or locally when `distro` is empty.
+    localOnly('wsl:connect', (_event, distro) => {
+        (0, menu_1.relaunchWithWslDistro)(distro || '');
+    });
+    // Execute JavaScript inside an Electron <webview> guest's isolated world.
+    // Only the renderer that hosts the <webview> may target it, and worldId is
+    // bounded to [MIN, MAX] so it can never hit the main (0) or preload worlds
+    // and stays well below Chromium's fatal ISOLATED_WORLD_ID_MAX CHECK.
+    const MIN_ISOLATED_WORLD_ID = 1000;
+    const MAX_ISOLATED_WORLD_ID = 100000;
+    localOnly('webview:execute-js-isolated-world', async (event, webContentsId, worldId, code) => {
+        if (typeof webContentsId !== 'number' ||
+            !Number.isInteger(webContentsId) ||
+            webContentsId <= 0) {
+            throw new Error(`Invalid webContentsId: ${String(webContentsId)}`);
+        }
+        if (typeof worldId !== 'number' ||
+            !Number.isInteger(worldId) ||
+            worldId < MIN_ISOLATED_WORLD_ID ||
+            worldId > MAX_ISOLATED_WORLD_ID) {
+            throw new Error(`Invalid isolated worldId: ${String(worldId)} (must be in [${MIN_ISOLATED_WORLD_ID}, ${MAX_ISOLATED_WORLD_ID}])`);
+        }
+        if (typeof code !== 'string') {
+            throw new Error('code must be a string');
+        }
+        const wc = electron_1.webContents.fromId(webContentsId);
+        const isWcv = wcvBrowserRegistry_1.wcvBrowserRegistry.isRegisteredWcv(webContentsId);
+        if (!wc || wc.isDestroyed() || (wc.getType() !== 'webview' && !isWcv)) {
+            throw new Error(`Invalid or non-webview webContents id: ${webContentsId}`);
+        }
+        const sender = event?.sender;
+        const isOwned = isWcv
+            ? wcvBrowserRegistry_1.wcvBrowserRegistry.isOwnedBySender(webContentsId, sender?.id)
+            : wc.hostWebContents?.id === sender?.id;
+        if (!sender || sender.isDestroyed() || !isOwned) {
+            throw new Error(`WebContents ${webContentsId} is not owned by the calling renderer`);
+        }
+        if (!event?.senderFrame ||
+            event.senderFrame !== sender.mainFrame ||
+            event.senderFrame.parent) {
+            throw new Error('webview:execute-js-isolated-world must be called from the main frame');
+        }
+        return (0, isolatedWorldExec_1.executeJavaScriptInIsolatedWorldWhenReady)(wc, worldId, [{ code }], false);
+    });
+    const resolveOwnedGuestWebContents = (event, webContentsId) => {
+        if (typeof webContentsId !== 'number' ||
+            !Number.isInteger(webContentsId) ||
+            webContentsId <= 0) {
+            throw new Error(`Invalid webContentsId: ${String(webContentsId)}`);
+        }
+        const wc = electron_1.webContents.fromId(webContentsId);
+        const isWcv = wcvBrowserRegistry_1.wcvBrowserRegistry.isRegisteredWcv(webContentsId);
+        if (!wc || wc.isDestroyed() || (wc.getType() !== 'webview' && !isWcv)) {
+            throw new Error(`Invalid or non-webview webContents id: ${webContentsId}`);
+        }
+        const sender = event?.sender;
+        const isOwned = isWcv
+            ? wcvBrowserRegistry_1.wcvBrowserRegistry.isOwnedBySender(webContentsId, sender?.id)
+            : wc.hostWebContents?.id === sender?.id;
+        if (!sender || sender.isDestroyed() || !isOwned) {
+            throw new Error(`WebContents ${webContentsId} is not owned by the calling renderer`);
+        }
+        return { wc, sender };
+    };
+    localOnly('webview:get-network-requests', (event, webContentsId) => {
+        const { wc, sender } = resolveOwnedGuestWebContents(event, webContentsId);
+        if (!event?.senderFrame ||
+            (sender.mainFrame && event.senderFrame !== sender.mainFrame) ||
+            event.senderFrame.parent) {
+            throw new Error('webview:get-network-requests must be called from the main frame');
+        }
+        return guestNetworkController_1.guestNetworkController.getRequests(wc.id);
+    });
+    localOnly('webview:clear-network-requests', (event, webContentsId) => {
+        const { wc, sender } = resolveOwnedGuestWebContents(event, webContentsId);
+        if (!event?.senderFrame ||
+            (sender.mainFrame && event.senderFrame !== sender.mainFrame) ||
+            event.senderFrame.parent) {
+            throw new Error('webview:clear-network-requests must be called from the main frame');
+        }
+        return guestNetworkController_1.guestNetworkController.clearRequests(wc.id);
+    });
+    const guestOf = (e, id) => {
+        const { wc, sender } = resolveOwnedGuestWebContents(e, id);
+        const f = e?.senderFrame;
+        if (!f || f.parent || (sender.mainFrame && f !== sender.mainFrame)) {
+            throw new Error('WebMCP IPC must be called from the main frame');
+        }
+        return { wc, sender };
+    };
+    localOnly('webview:webmcp-set-enabled', (event, enabled) => {
+        if (!(0, wcvIpcHandlers_1.isAuthorizedHubMainFrameEvent)(event) || typeof enabled !== 'boolean') {
+            throw new Error('Invalid webview:webmcp-set-enabled call');
+        }
+        guestWebMcpController_1.guestWebMcpController.setEnabled(enabled);
+        return guestWebMcpController_1.guestWebMcpController.isEnabled();
+    });
+    localOnly('webview:webmcp-list-tools', (event, webContentsId, origin) => guestWebMcpController_1.guestWebMcpController.listTools(guestOf(event, webContentsId).wc, origin));
+    localOnly('webview:webmcp-call-tool', (event, webContentsId, origin, params) => {
+        const { wc, sender } = guestOf(event, webContentsId);
+        return guestWebMcpController_1.guestWebMcpController.callTool(wc, sender, origin, params);
+    });
+    localOnly('webview:webmcp-cancel-tool-call', (event, webContentsId, callId) => guestWebMcpController_1.guestWebMcpController.cancelToolCall(webContentsId, callId, guestOf(event, webContentsId).sender.id));
+    localOnly('webview:set-dialog-policy', async (event, webContentsId, policy) => {
+        const { wc, sender } = resolveOwnedGuestWebContents(event, webContentsId);
+        const safePolicy = {
+            enabled: Boolean(policy?.enabled),
+        };
+        if (policy?.action === 'accept' ||
+            policy?.action === 'dismiss' ||
+            policy?.action === 'manual') {
+            safePolicy.action = policy.action;
+        }
+        if (typeof policy?.promptText === 'string') {
+            safePolicy.promptText = policy.promptText;
+        }
+        if (typeof policy?.tabKey === 'string') {
+            safePolicy.tabKey = policy.tabKey;
+        }
+        if (policy?.fallbackAction === 'accept' ||
+            policy?.fallbackAction === 'dismiss') {
+            safePolicy.fallbackAction = policy.fallbackAction;
+        }
+        if (typeof policy?.fallbackPromptText === 'string') {
+            safePolicy.fallbackPromptText = policy.fallbackPromptText;
+        }
+        return guestDialogController_1.guestDialogController.setPolicy(wc, sender, safePolicy);
+    });
+    localOnly('webview:handle-javascript-dialog', async (event, webContentsId, decision) => {
+        const { wc } = resolveOwnedGuestWebContents(event, webContentsId);
+        return guestDialogController_1.guestDialogController.handleDialog(wc, {
+            ...(typeof decision?.dialogId === 'string'
+                ? { dialogId: decision.dialogId }
+                : {}),
+            accept: Boolean(decision?.accept),
+            ...(typeof decision?.promptText === 'string'
+                ? { promptText: decision.promptText }
+                : {}),
+        });
+    });
+    electron_1.ipcMain.removeListener?.(webviewPromptPreload_1.HUMAN_PROMPT_SYNC_CHANNEL, onHumanPromptSync);
+    electron_1.ipcMain.on?.(webviewPromptPreload_1.HUMAN_PROMPT_SYNC_CHANNEL, onHumanPromptSync);
+    electron_1.ipcMain.removeListener?.(guestPromptController_1.WEBVIEW_PROMPT_SUBSCRIBER_STATE_CHANNEL, onHumanPromptSubscriberState);
+    electron_1.ipcMain.on?.(guestPromptController_1.WEBVIEW_PROMPT_SUBSCRIBER_STATE_CHANNEL, onHumanPromptSubscriberState);
+    localOnly(guestPromptController_1.WEBVIEW_PROMPT_RESPONSE_CHANNEL, (event, promptId, value) => {
+        if (!isMainFramePromptCaller(event)) {
+            throw new Error('webview:prompt-response must be called from the main frame');
+        }
+        return guestPromptController_1.guestPromptController.respondPrompt(event.sender.id, promptId, typeof value === 'string' ? value : null);
+    });
+    const assertMainFrameSender = (event, channel) => {
+        const sender = event?.sender;
+        if (!sender ||
+            sender.isDestroyed() ||
+            !event?.senderFrame ||
+            event.senderFrame !== sender.mainFrame ||
+            event.senderFrame.parent) {
+            throw new Error(`${channel} must be called from the main frame`);
+        }
+    };
+    // The renderer only names a conversation; the uploads root itself is always
+    // derived here from the app data dir the Language Server was started with.
+    const pinUploadsRoot = (conversationId) => {
+        if (typeof conversationId !== 'string' ||
+            !SAFE_UPLOAD_CONVERSATION_ID_RE.test(conversationId) ||
+            /^\.+$/.test(conversationId)) {
+            return '';
+        }
+        let appDataDir = (0, paths_1.getAppDataDir)();
+        try {
+            appDataDir = fsSync.realpathSync(appDataDir);
+        }
+        catch {
+            // Upload validation reports the missing directory.
+        }
+        return path.join(appDataDir, 'brain', conversationId, 'browser_sandbox', 'uploads');
+    };
+    const resolveMainFrameOwnedGuest = (event, webContentsId, channel) => {
+        const { wc, sender } = resolveOwnedGuestWebContents(event, webContentsId);
+        assertMainFrameSender(event, channel);
+        return { wc, sender };
+    };
+    localOnly('webview:set-file-chooser-policy', async (event, webContentsId, policy) => {
+        const { wc, sender } = resolveMainFrameOwnedGuest(event, webContentsId, 'webview:set-file-chooser-policy');
+        return guestFileChooserController_1.guestFileChooserController.setPolicy(wc, sender, {
+            enabled: Boolean(policy?.enabled),
+            ...(typeof policy?.tabKey === 'string' ? { tabKey: policy.tabKey } : {}),
+        });
+    });
+    localOnly('webview:handle-file-chooser', async (event, webContentsId, decision) => {
+        const { wc } = resolveMainFrameOwnedGuest(event, webContentsId, 'webview:handle-file-chooser');
+        const pinned = {
+            ...(decision ?? { chooserId: '' }),
+        };
+        if (Array.isArray(pinned.files) && pinned.files.length > 0) {
+            pinned.allowedUploadsDir = pinUploadsRoot(pinned.expectedConversationId);
+        }
+        return guestFileChooserController_1.guestFileChooserController.handleFileChooser(wc, pinned);
+    });
+    localOnly('webview:set-input-files', async (event, webContentsId, request) => {
+        const { wc } = resolveMainFrameOwnedGuest(event, webContentsId, 'webview:set-input-files');
+        return guestFileChooserController_1.guestFileChooserController.setInputFiles(wc, {
+            ...request,
+            allowedUploadsDir: pinUploadsRoot(request?.expectedConversationId),
+        });
+    });
+    localOnly('webview:resolve-upload-files', (event, req) => {
+        assertMainFrameSender(event, 'webview:resolve-upload-files');
+        return (0, guestFileChooserController_1.resolveGuestUploadFiles)(req && {
+            ...req,
+            uploadsRoot: pinUploadsRoot(req.expectedConversationId),
+        });
+    });
+    const assertMainFrameGuestCaller = (event, webContentsId, channel) => resolveMainFrameOwnedGuest(event, webContentsId, channel).wc;
+    localOnly('webview:list-frames', async (event, wcId, options) => guestFrameBridge_1.guestFrameBridge.listFrames(assertMainFrameGuestCaller(event, wcId, 'webview:list-frames'), options));
+    localOnly('webview:execute-js-frame-isolated-world', async (event, wcId, frameId, code, expectedOrigin, options) => {
+        const channel = 'webview:execute-js-frame-isolated-world';
+        const wc = assertMainFrameGuestCaller(event, wcId, channel);
+        return guestFrameBridge_1.guestFrameBridge.executeInFrameIsolatedWorld(wc, frameId, code, expectedOrigin, options);
+    });
+    // Execute an untrusted agent script inside a single-use, zero-egress
+    // Electron script jail and transfer the paired MessagePort to the caller.
+    localOnly('script-jail:run', async (event, req) => {
+        return (0, scriptJail_1.runScriptInJail)(event?.sender, req, event?.senderFrame);
+    });
+    localOnly('script-jail:abort', (event, jailId) => {
+        return (0, scriptJail_1.abortScriptInJail)(event?.sender, jailId, event?.senderFrame);
+    });
+    localOnly('script-jail:warm', async (event) => {
+        return (0, scriptJail_1.warmScriptJail)(event?.sender, event?.senderFrame);
+    });
+    (0, wcvIpcHandlers_1.registerWcvIpcHandlers)(undefined, undefined, storageManager);
+    return {
+        closeContextMenu: (win) => {
+            if (activeContextMenuOwner === win) {
+                activeContextMenu?.closePopup?.(win);
+                activeContextMenu = null;
+                activeContextMenuOwner = undefined;
+            }
+        },
+    };
+}
+
+
+const contextMenuTranslationMap = {
+  // 基础剪贴板与选择
+  'Cut': '剪切',
+  'Copy': '复制',
+  'Paste': '粘贴',
+  'Select All': '全选',
+  'Undo': '撤销',
+  'Redo': '重做',
+  'Delete': '删除',
+
+  // 内置浏览器 Webview 与窗格导航菜单
+  'Comment': '评论',
+  'Back': '后退',
+  'Forward': '前进',
+  'Reload': '重新加载',
+  'Go Back': '后退',
+  'Go Forward': '前进',
+  'Add to Chat': '添加到对话',
+  'Find in Pane': '在窗格中查找',
+  'Split Terminal': '拆分终端',
+  'Kill Terminal': '终止终端',
+  'Settings': '设置',
+
+  // 项目与工作区右键菜单（项目文件夹）
+  'Copy Project Name': '复制项目名称',
+  'Copy Project Path': '复制项目路径',
+  'Project Settings': '项目设置',
+  'Delete Project': '删除项目',
+  'Rename Project': '重命名项目',
+  'Open Project': '打开项目',
+  'Open Folder': '打开文件夹',
+  'New Folder': '新建文件夹',
+  'Remove Project': '移除项目',
+  'Remove from List': '从列表中移除',
+  'Project options': '项目选项',
+
+  // 对话列表与分组右键菜单
+  'New Conversation': '新建对话',
+  'Fork': '派生',
+  'Fork Conversation': '派生对话',
+  'Rename': '重命名',
+  'Rename Group': '重命名分组',
+  'Move Up': '上移',
+  'Move Down': '下移',
+  'Delete Group': '删除分组',
+  'Restore': '恢复',
+  'View Debug': '查看调试信息',
+  'Telemetry': '遥测',
+  'Pin': '置顶',
+  'Unpin': '取消置顶',
+  'Auto Pin': '自动置顶',
+  'Mark Unread': '标为未读',
+  'Mark Read': '标为已读',
+  'Mark as Unread': '标为未读',
+  'Mark as Read': '标为已读',
+  'Split': '拆分',
+  'Split Conversation': '拆分对话',
+  'Stop': '停止',
+  'Stop Agent': '停止智能体',
+  'Resume': '恢复',
+  'Restart': '重新启动',
+  'Close': '关闭',
+  'Close Others': '关闭其他',
+  'Close All': '全部关闭',
+  'Copy Path': '复制路径',
+  'Copy Relative Path': '复制相对路径',
+  'Reveal in File Explorer': '在文件资源管理器中显示',
+  'Reveal in Finder': '在访达中显示',
+  'Open in Terminal': '在终端中打开',
+  'View Usage': '查看使用额度',
+  'Duplicate': '创建副本',
+  'Archive': '归档',
+  'Archive Conversation': '归档对话',
+  'Unarchive': '取消归档',
+  'Unarchive Conversation': '取消归档对话',
+  'Share': '分享',
+  'Copy Link': '复制链接',
+  'Export': '导出',
+  'Export Conversation': '导出对话',
+  'Clear': '清除',
+  'Clear History': '清除历史',
+  'Automations': '自动化',
+  'Automation': '自动化',
+  'Give Feedback': '提供反馈',
+  'Provide Feedback': '提供反馈',
+  // 顶置对话与排序菜单
+  'Sort By': '排序方式',
+  'Sort by': '排序方式',
+  'Last Updated': '最近更新',
+  'Last Prompt': '最新提示词',
+  'Custom Order': '自定义排序',
+  'Quote': '引用',
+  'Quote Ctrl+L': '引用 Ctrl+L',
+  'Quote Cmd+L': '引用 Cmd+L',
+
+  // 顶层与二级右键子菜单 (v2.32.1 补充)
+  'Conversation Name': '对话名称',
+  'Conversation ID': '对话 ID',
+  'Project Name': '项目名称',
+  'Project Path': '项目路径',
+  'Workspace Name': '工作区名称',
+  'Workspace Path': '工作区路径',
+  'Worktree Name': '工作树名称',
+  'Conversation Path': '对话路径',
+  'Split Right': '向右分屏',
+  'Split Down': '向下分屏',
+  'Split Left': '向左分屏',
+  'Split Up': '向上分屏',
+  'Replace with New': '替换为新建',
+  'Replace With New': '替换为新建',
+  'Replace with new': '替换为新建',
+  'Ask /btw': '通过 /btw 提问',
+  // 侧边栏标签页、文件查看器、媒体与链接右键菜单补充
+  'Close Tab': '关闭标签页',
+  'Close Other Tabs': '关闭其他标签页',
+  'Close Tabs to the Left': '关闭左侧标签页',
+  'Close Tabs to the Right': '关闭右侧标签页',
+  'Close All Tabs': '关闭全部标签页',
+  'Close Terminal Tab': '关闭终端标签页',
+  'Keep Open': '保持打开',
+  'Pin Tab': '固定标签页',
+  'Unpin Tab': '取消固定标签页',
+  'Reopen Closed Tab': '重新打开已关闭的标签页',
+  'Open in Tab': '在标签页中打开',
+  'Open in New Tab': '在新标签页中打开',
+  'Open in New Window': '在新窗口中打开',
+  'Open in Side Panel': '在侧边栏中打开',
+  'Open in Built-in Browser': '在内置浏览器中打开',
+  'Open in External Browser': '在外部浏览器中打开',
+  'Open Link in New Tab': '在新标签页中打开链接',
+  'Open Link in External Browser': '在外部浏览器中打开链接',
+  'Open Image in New Tab': '在新标签页中打开图片',
+  'Open Conversation in New Tab': '在新标签页中打开对话',
+  'Open In': '打开方式',
+  'Side Panel': '侧边栏',
+  'Built-in Browser': '内置浏览器',
+  'External Browser': '外部浏览器',
+  'Link Settings': '链接设置',
+  'Copy Image': '复制图片',
+  'Copy Image Address': '复制图片地址',
+  'Copy Link Address': '复制链接地址',
+  'Copy Message': '复制消息',
+  'Save Image': '保存图片',
+  'Save Video': '保存视频',
+  'Undo to Here': '撤销到此处',
+  'Edit Shortcut': '编辑快捷键',
+  'Add Shortcut': '添加快捷键',
+  'Remove Shortcut': '移除快捷键',
+  'Reset to Default': '重置为默认',
+  'Move to Group': '移动到分组',
+  'New Group': '新建分组',
+  'Remove from Group': '从分组中移除',
+  'Delete Permanently': '永久删除',
+  'Proceed with Plan': '按计划继续',
+  // 2.32.2 新增上下文菜单与分屏/远程操作
+  'Copy Conversation Markdown': '复制对话 Markdown',
+  'Pin This Conversation': '置顶此对话',
+  'Unpin This Conversation': '取消置顶此对话',
+  'Rename This Conversation': '重命名此对话',
+  'Copy Trajectory ID': '复制轨迹 ID',
+  'Copy Config File Path': '复制配置文件路径',
+  'Remove From Split': '从分屏中移除',
+  'Remove from Split': '从分屏中移除',
+  'Remove from Recent': '从最近记录中移除',
+  'Find References': '查找引用',
+  'Open on phone': '在手机上打开',
+  'Open on another device': '在其他设备上打开',
+  'Coordinator settings': '协调器设置',
+  // 2.33.0 新增菜单、Computer Use 虚拟机控制、SSH 远程操作与组合包
+  'Interrupt Agent': '中断智能体',
+  'Disconnect': '断开连接',
+  'Stop Server': '停止服务端',
+  'Stop SSH Server': '停止 SSH 服务端',
+  'Stop SSH Server…': '停止 SSH 服务端…',
+  'Restart SSH Server': '重启 SSH 服务端',
+  'SSH Host…': 'SSH 主机…',
+  'SSH Host...': 'SSH 主机...',
+  'Connect to SSH Host': '连接到 SSH 主机',
+  'Connect to SSH Host…': '连接到 SSH 主机…',
+  'Side Question Selection': '针对所选内容发起侧边提问',
+  'Quote Selection': '引用所选内容',
+  'Open in Code Search': '在代码搜索中打开',
+  'Comment on Selection': '针对所选内容添加评论',
+  'Switch to This Computer': '切换到本机',
+  'This Computer': '本机',
+  'Toggle Virtual Machine': '切换虚拟机面板',
+  'Agents': '智能体',
+  'Screen Recording': '屏幕录制',
+  'Add bundle': '添加组合包',
+  'Remove bundle': '移除组合包',
+  'Terminal: Select All': '终端：全选',
+  'Terminal: Add to Chat': '终端：添加到对话',
+  'Maximize': '最大化',
+  'Delete Hook': '删除钩子',
+  'Add Hook Card': '添加钩子卡片',
+  'Delete Handler': '删除处理程序',
+  // 2.34.0 右侧预览栏、插件侧栏、消息气泡与发送按钮原生右键菜单补齐
+  'Copy File Path': '复制文件路径',
+  'Copy File Name': '复制文件名',
+  'Copy Content': '复制内容',
+  'Hide': '隐藏',
+  'Reply': '回复',
+  'Manual Order': '手动排序',
+  'Send Message': '发送消息',
+  'Queue Message': '排队发送消息',
+  'Send Immediately': '立即发送',
+  // 2.35.0 收件箱、对话移动、侧边提问继续、打开方式与远程智能体原生上下文菜单补齐
+  'Resolve': '标为已解决',
+  'Return to Inbox': '移回收件箱',
+  'Inbox Mode': '收件箱模式',
+  'Working Section': '“正在工作”分组',
+  'Auto-Resolve': '自动解决',
+  'Subtitle': '副标题',
+  'Move to Project': '移动到项目',
+  'Move to Workspace': '移动到工作区',
+  'New Project...': '新建项目...',
+  'New Workspace...': '新建工作区...',
+  'Remove from Project': '从项目中移除',
+  'Remove from Workspace': '从工作区中移除',
+  'Continue as a New Conversation': '作为新对话继续',
+  'Continue in Current Workspace': '在当前工作区继续',
+  'Continue in Shared Workspace': '在共享工作区继续',
+  'Continue in New Workspace': '在新工作区继续',
+  'Open with': '打开方式',
+  'Text viewer': '文本查看器',
+  'Image viewer': '图片查看器',
+  'Video player': '视频播放器',
+  'Audio player': '音频播放器',
+  'HTML viewer': 'HTML 查看器',
+  'Notebook viewer': 'Notebook 查看器',
+  'PDF viewer': 'PDF 查看器',
+  'System default app': '系统默认应用',
+  'Application Menu': '应用菜单',
+  'For Me': '仅自己使用',
+  'For My Team': '团队共享',
+};
+function translateContextLabel(lbl) {
+  if (!lbl) return '';
+  const trimmed = typeof lbl === 'string' ? lbl.trim() : '';
+  if (contextMenuTranslationMap[lbl]) return contextMenuTranslationMap[lbl];
+  if (contextMenuTranslationMap[trimmed]) return contextMenuTranslationMap[trimmed];
+  if (/\s+\(Default\)$/i.test(trimmed)) {
+    const base = trimmed.replace(/\s+\(Default\)$/i, '').trim();
+    if (contextMenuTranslationMap[base]) return contextMenuTranslationMap[base] + '（默认）';
+    const openMatch = base.match(/^Open in\s+(.+)$/i);
+    if (openMatch) return '在 ' + openMatch[1] + ' 中打开（默认）';
+  }
+  const statusSuffixMatch = trimmed.match(/^(.+?)\s+\((Not running|Sidecar disabled)\)$/);
+  if (statusSuffixMatch) {
+    const baseCn = contextMenuTranslationMap[statusSuffixMatch[1]] || statusSuffixMatch[1];
+    const reasonCn = statusSuffixMatch[2] === 'Sidecar disabled' ? 'Sidecar 已禁用' : '未运行';
+    return baseCn + '（' + reasonCn + '）';
+  }
+  let m = trimmed.match(/^Move to Group:\s*(.+)$/i);
+  if (m) return '移动到分组：' + m[1];
+  m = trimmed.match(/^Remove\s+(.+)\s+from Recent$/i);
+  if (m) return '从最近记录中移除 ' + m[1];
+  m = trimmed.match(/^Hide\s+(.+)\s+from this list$/i);
+  if (m) return '从此列表中隐藏 ' + m[1];
+  m = trimmed.match(/^Show\s+(.+)\s+in the list again$/i);
+  if (m) return '在列表中重新显示 ' + m[1];
+  m = trimmed.match(/^Open in\s+(.+)$/i);
+  if (m) return '在 ' + m[1] + ' 中打开';
+  return lbl;
+}
